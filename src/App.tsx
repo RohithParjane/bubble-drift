@@ -1,10 +1,39 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { HandLandmarker, HandLandmarkerResult } from "@mediapipe/tasks-vision";
 import { Field } from "./field";
-import { playPop, setSound, unlockSound } from "./sound";
+import { playChime, playPop, setSound, unlockSound } from "./sound";
 import { createLandmarker, drawHand, palmCenter } from "./hand";
 
 type Status = "idle" | "loading" | "active";
+type Phase = "break" | "done";
+
+const BREAK_MS = 10 * 60 * 1000;
+
+/** Countdown pill + shrinking bar. Kept in its own component so the 2 fps tick never re-renders the scene. */
+function BreakTimer({ endsAt, onDone }: { endsAt: number; onDone: () => void }) {
+  const [left, setLeft] = useState(() => Math.max(0, endsAt - Date.now()));
+  const fired = useRef(false);
+  useEffect(() => {
+    fired.current = false;
+    const tick = () => {
+      const ms = Math.max(0, endsAt - Date.now());
+      setLeft(ms);
+      if (ms <= 0 && !fired.current) { fired.current = true; onDone(); }
+    };
+    tick();
+    const id = window.setInterval(tick, 500); // wall clock, so a throttled tab can't stretch the break
+    return () => window.clearInterval(id);
+  }, [endsAt, onDone]);
+  const secs = Math.ceil(left / 1000);
+  const label = `${Math.floor(secs / 60)}:${String(secs % 60).padStart(2, "0")}`;
+  const pct = Math.max(0, Math.min(1, left / BREAK_MS));
+  return (
+    <div className="meter" role="timer" aria-label={`${label} left of your 10 minute break`}>
+      <span className="meter-time">{label}</span>
+      <span className="meter-track"><i style={{ transform: `scaleX(${pct})` }} /></span>
+    </div>
+  );
+}
 
 export default function App() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -22,6 +51,8 @@ export default function App() {
   const [tracking, setTracking] = useState(false);
   const [message, setMessage] = useState("");
   const [sound, setSoundOn] = useState(true);
+  const [phase, setPhase] = useState<Phase>("break");
+  const [endsAt, setEndsAt] = useState(0);
 
   // render loop (no React state touched per frame)
   useEffect(() => {
@@ -133,12 +164,28 @@ export default function App() {
   useEffect(() => () => stopCamera(), [stopCamera]);
 
   const onMove = (e: React.PointerEvent) => {
-    if (!started || handNow.current) return;
+    if (!started || phase !== "break" || handNow.current) return;
     field.current.setTarget(e.clientX, e.clientY);
   };
   const onLeave = () => { if (!handNow.current) field.current.release(); };
 
-  const begin = () => { unlockSound(); setStarted(true); void startCamera(); };
+  const startBreak = useCallback((withCamera: boolean) => {
+    unlockSound();
+    setPhase("break");
+    setEndsAt(Date.now() + BREAK_MS);
+    setStarted(true);
+    if (withCamera) void startCamera();
+  }, [startCamera]);
+
+  // break over: chime, release the camera, show the card
+  const finishBreak = useCallback(() => {
+    playChime();
+    stopCamera();
+    setPhase("done");
+  }, [stopCamera]);
+
+  const anotherBreak = () => { setPhase("break"); setEndsAt(Date.now() + BREAK_MS); };
+  const backToWork = () => { setStarted(false); setPhase("break"); setEndsAt(Date.now() + BREAK_MS); setMessage(""); };
 
   return (
     <main className="stage" onPointerMove={onMove} onPointerDown={onMove}
@@ -153,15 +200,18 @@ export default function App() {
       {!started && (
         <section className="intro">
           <h1>Bubble Drift</h1>
-          <p className="sub">Move gently. Let everything flow.</p>
-          <button className="primary" onClick={begin}>Start Experience</button>
-          <button className="quiet" onClick={() => { unlockSound(); setStarted(true); }}>Continue with mouse or touch</button>
-          <p className="note">Touch a bubble with the dot to pop it. Your camera is only used when you press Start. Frames are processed
-            on this device — nothing is recorded, saved or uploaded.</p>
+          <p className="sub">A 10 minute break. Move gently. Let everything flow.</p>
+          <button className="primary" onClick={() => startBreak(true)}>Start 10 minute break</button>
+          <button className="quiet" onClick={() => startBreak(false)}>Continue with mouse or touch</button>
+          <p className="note">Touch a bubble with the dot to pop it. When the 10 minutes are up I&apos;ll nudge you back to work.
+            Your camera is only used when you press Start, and frames are processed on this device — nothing is recorded, saved
+            or uploaded.</p>
         </section>
       )}
 
-      {started && (
+      {started && phase === "break" && <BreakTimer endsAt={endsAt} onDone={finishBreak} />}
+
+      {started && phase === "break" && (
         <footer className="bar">
           {status === "active" && (
             <span className="live" aria-live="polite">
@@ -181,6 +231,19 @@ export default function App() {
         </footer>
       )}
       {message && <p className="toast" role="status">{message}</p>}
+
+      {phase === "done" && (
+        <section className="rest" role="dialog" aria-modal="true" aria-labelledby="rest-message">
+          <div className="rest-card">
+            <p className="rest-kicker">10 minute break · complete</p>
+            <h2 id="rest-message">You have taken 10 minutes break while popping up these bubbles now it&apos;s time to get back to work!</h2>
+            <div className="rest-btns">
+              <button className="primary" autoFocus onClick={anotherBreak}>Start another 10 minutes</button>
+              <button className="quiet" onClick={backToWork}>Back to work</button>
+            </div>
+          </div>
+        </section>
+      )}
     </main>
   );
 }
