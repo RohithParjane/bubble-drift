@@ -1,6 +1,6 @@
 interface Bubble { x: number; y: number; r: number; vx: number; vy: number; ph: number; w: number; wv: number; s: number; a: number; rise: number; }
 interface Spark { x: number; y: number; vx: number; vy: number; life: number; max: number; r: number; ring: boolean; }
-interface Cloud { img: HTMLCanvasElement; x: number; y: number; v: number; o: number; s: number; }
+interface Cloud { img: HTMLCanvasElement; x: number; y: number; v: number; o: number; w: number; h: number; }
 interface Land { img: HTMLCanvasElement; v: number; }
 
 const TAU = 6.283185;
@@ -10,20 +10,37 @@ const cv = (w: number, h: number) => { const c = document.createElement("canvas"
 function segDist(ax: number, ay: number, bx: number, by: number, px: number, py: number) {
   const dx = bx - ax, dy = by - ay, l = dx * dx + dy * dy;
   const t = l ? Math.max(0, Math.min(1, ((px - ax) * dx + (py - ay) * dy) / l)) : 0;
-  return Math.hypot(px - (ax + t * dx), py - (ay + t * dy));
+  const ex = px - (ax + t * dx), ey = py - (ay + t * dy);
+  return Math.sqrt(ex * ex + ey * ey);
 }
+
+/** Scenery only needs to be repainted ~20 times a second; bubbles repaint every frame. */
+const BG_INTERVAL = 0.05;
 
 /** Scenery, endless bubble stream, pop effects and hand dot. Lives outside React so frames never re-render the UI. */
 export class Field {
   bubbles: Bubble[] = []; sparks: Spark[] = [];
   W = 0; H = 0; calm = false; onPop?: (size: number) => void;
   private clock = 0; private nextSpawn = 0;
+  private bg: HTMLCanvasElement | null = null; private gb: CanvasRenderingContext2D | null = null;
+  private bs = 1; private lastBg = -1;
   private sky: HTMLCanvasElement | null = null; private land: Land[] = []; private clouds: Cloud[] = [];
   private sprites: HTMLCanvasElement[] = []; private hl: HTMLCanvasElement | null = null;
   private target = { x: 0, y: 0, on: false };
   private p = { x: 0, y: 0, vx: 0, vy: 0, on: false, a: 0 };
 
   private get goal() { return this.W < 600 ? 16 : 24; }
+
+  /**
+   * Sky, clouds and hills go to their own opaque canvas underneath the bubbles.
+   * Nothing there moves fast, so it is repainted at 20 fps instead of every frame —
+   * that removes six full-screen composites per frame (the old main cost).
+   */
+  attach(bg: HTMLCanvasElement) {
+    this.bg = bg;
+    this.gb = bg.getContext("2d", { alpha: false });
+    this.lastBg = -1;
+  }
 
   private make(initial: boolean): Bubble {
     const sc = Math.min(Math.max(Math.min(this.W, this.H) / 900, 0.6), 1.3);
@@ -33,14 +50,30 @@ export class Field {
   }
 
   resize(w: number, h: number, dpr = 1) {
-    this.W = w; this.H = h;
+    const bs = Math.max(0.5, Math.min(dpr, 1.25)); // scenery never needs more than 1.25 device pixels
+    const pw = Math.ceil(w * bs), ph = Math.ceil(h * bs);
+    const moved = w !== this.W || h !== this.H;
+    this.W = w; this.H = h; this.bs = bs;
     if (!this.sprites.length) this.buildSprites();
-    if (!this.clouds.length) for (let i = 0; i < 8; i++) {
-      const s = rnd(0.5, 1.5);
-      this.clouds.push({ img: this.cloudSprite(), x: rnd(0, w), y: rnd(-40, h * 0.55), v: rnd(4, 10) * s, o: 0.3 + s * 0.3, s });
+    if (!this.clouds.length) this.buildClouds();
+    if (this.bg && this.gb && (!this.sky || this.bg.width !== pw || this.bg.height !== ph)) {
+      this.bg.width = pw; this.bg.height = ph; // also clears the canvas
+      this.buildScenery(bs);
+      this.lastBg = -1;
     }
-    this.buildScenery(dpr);
     if (!this.bubbles.length) for (let i = 0; i < this.goal; i++) this.bubbles.push(this.make(true));
+    else if (moved) for (const b of this.bubbles) {
+      b.x = Math.min(Math.max(b.x, b.r), Math.max(b.r, w - b.r));
+      b.y = Math.min(Math.max(b.y, b.r), Math.max(b.r, h - b.r));
+    }
+  }
+
+  private buildClouds() {
+    for (let i = 0; i < 7; i++) {
+      const s = rnd(0.55, 1.5);
+      this.clouds.push({ img: this.cloudSprite(), x: rnd(0, this.W), y: rnd(-40, this.H * 0.55),
+        v: rnd(4, 10) * s, o: 0.3 + s * 0.3, w: 520 * s, h: 220 * s });
+    }
   }
 
   private cloudSprite() {
@@ -54,9 +87,10 @@ export class Field {
     return c;
   }
 
-  private buildScenery(dpr: number) {
-    const W = Math.round(this.W * dpr), H = Math.round(this.H * dpr);
-    const c = cv(W, H), g = c.getContext("2d")!;
+  private buildScenery(bs: number) {
+    const W = this.W, H = this.H, pw = Math.ceil(W * bs), ph = Math.ceil(H * bs);
+    const c = cv(pw, ph), g = c.getContext("2d")!;
+    g.setTransform(bs, 0, 0, bs, 0, 0);
     const sky = g.createLinearGradient(0, 0, 0, H);
     sky.addColorStop(0, "#2a74cf"); sky.addColorStop(0.5, "#6fb2ec"); sky.addColorStop(0.75, "#cfe8fa"); sky.addColorStop(1, "#e6f3fb");
     g.fillStyle = sky; g.fillRect(0, 0, W, H);
@@ -71,7 +105,8 @@ export class Field {
       { base: 0.89, amp: 0.045, v: 26, top: "#58986b", bot: "#8cc488", k: [4, 9], trees: 10 },
     ];
     this.land = cfg.map((l) => {
-      const img = cv(W, H), x = img.getContext("2d")!;
+      const img = cv(pw, ph), x = img.getContext("2d")!;
+      x.setTransform(bs, 0, 0, bs, 0, 0);
       const p0 = rnd(0, TAU), p1 = rnd(0, TAU);
       const yAt = (px: number) => (l.base + l.amp * (0.6 * Math.sin((TAU * l.k[0] * px) / W + p0) + 0.4 * Math.sin((TAU * l.k[1] * px) / W + p1))) * H;
       const gr = x.createLinearGradient(0, (l.base - l.amp) * H, 0, H);
@@ -124,6 +159,7 @@ export class Field {
       this.sparks.push({ x: b.x + Math.cos(a) * b.r * 0.8, y: b.y + Math.sin(a) * b.r * 0.8, vx: Math.cos(a) * s, vy: Math.sin(a) * s,
         life: 0.7, max: 0.7, r: rnd(1.5, 4), ring: false });
     }
+    if (this.sparks.length > 260) this.sparks.splice(0, this.sparks.length - 260); // stay bounded on fast swipes
     this.onPop?.(b.r);
   }
 
@@ -131,42 +167,46 @@ export class Field {
     this.clock = t;
     const k = this.calm ? 0.35 : 1, p = this.p, tg = this.target;
     const wind = Math.sin(t * 0.07) * 9 * k;
-    for (const c of this.clouds) { c.x += (c.v + wind * 0.3) * k * dt; if (c.x > this.W + 40) c.x = -520 * c.s; if (c.x < -520 * c.s - 40) c.x = this.W; }
+    for (const c of this.clouds) {
+      c.x += (c.v + wind * 0.3) * k * dt;
+      if (c.x > this.W + 40) c.x = -c.w - 40;
+      else if (c.x < -c.w - 40) c.x = this.W + 40;
+    }
     // endless stream: new bubbles rise from the meadow whenever the sky has room
     if (this.bubbles.length < this.goal && t >= this.nextSpawn) { this.bubbles.push(this.make(false)); this.nextSpawn = t + rnd(0.35, 0.9); }
     // hand dot: adaptive smoothing (heavy when still = no jitter, light when fast = no lag)
     const wasOn = p.on, ox = p.x, oy = p.y;
     if (tg.on) {
       if (!wasOn) { p.x = tg.x; p.y = tg.y; p.vx = p.vy = 0; }
-      const rate = 7 + Math.min(Math.hypot(p.vx, p.vy), 1800) * 0.014;
+      const rate = 7 + Math.min(Math.sqrt(p.vx * p.vx + p.vy * p.vy), 1800) * 0.014;
       const a = 1 - Math.exp(-rate * dt), nx = p.x + (tg.x - p.x) * a, ny = p.y + (tg.y - p.y) * a, m = 1 - Math.exp(-8 * dt);
       p.vx += ((nx - p.x) / dt - p.vx) * m; p.vy += ((ny - p.y) / dt - p.vy) * m; p.x = nx; p.y = ny;
     }
     p.on = tg.on; p.a += ((p.on ? 1 : 0) - p.a) * (1 - Math.exp(-9 * dt));
-    const relax = 1 - Math.exp(-1.4 * dt);
+    const relax = 1 - Math.exp(-1.4 * dt), speed = Math.sqrt(p.vx * p.vx + p.vy * p.vy);
     for (let i = this.bubbles.length - 1; i >= 0; i--) {
       const b = this.bubbles[i];
       b.a = Math.min(1, b.a + dt * 0.8);
       if (p.on && b.a > 0.6) {
         // swept test along the hand's path so fast swipes never skip over a bubble
         if (segDist(wasOn ? ox : p.x, wasOn ? oy : p.y, p.x, p.y, b.x, b.y) < b.r * 0.92) { this.pop(b); this.bubbles.splice(i, 1); continue; }
-        const d = Math.hypot(b.x - p.x, b.y - p.y), reach = b.r + 110;
+        const bdx = b.x - p.x, bdy = b.y - p.y, d = Math.sqrt(bdx * bdx + bdy * bdy), reach = b.r + 110;
         if (d < reach) {
           const f = 1 - d / reach;
           b.vx += p.vx * f * f * 3 * k * dt; b.vy += p.vy * f * f * 3 * k * dt;
-          b.wv += f * Math.min(Math.hypot(p.vx, p.vy), 1500) * 0.0016 * k;
+          b.wv += f * Math.min(speed, 1500) * 0.0016 * k;
         }
       }
       // ease back toward a slow, rising drift (natural damping)
       const tvx = wind + Math.sin(t * 0.31 + b.ph) * 10 * k, tvy = -b.rise * k + Math.cos(t * 0.23 + b.ph * 1.7) * 6 * k;
       b.vx += (tvx - b.vx) * relax; b.vy += (tvy - b.vy) * relax;
       b.wv += (-38 * b.w - 3.2 * b.wv) * dt; b.w = Math.max(-0.2, Math.min(0.2, b.w + b.wv * dt));
-      const v = Math.hypot(b.vx, b.vy); if (v > 500) { b.vx *= 500 / v; b.vy *= 500 / v; }
+      const v = Math.sqrt(b.vx * b.vx + b.vy * b.vy); if (v > 500) { b.vx *= 500 / v; b.vy *= 500 / v; }
       b.x += b.vx * dt; b.y += b.vy * dt;
       if (b.x < b.r) { b.x = b.r; b.vx = Math.abs(b.vx) * 0.5; }
-      if (b.x > this.W - b.r) { b.x = this.W - b.r; b.vx = -Math.abs(b.vx) * 0.5; }
+      else if (b.x > this.W - b.r) { b.x = this.W - b.r; b.vx = -Math.abs(b.vx) * 0.5; }
       if (b.y > this.H - b.r) { b.y = this.H - b.r; b.vy = -Math.abs(b.vy) * 0.5; }
-      if (b.y < -b.r) this.bubbles.splice(i, 1); // drifted away above the sky
+      else if (b.y < -b.r) this.bubbles.splice(i, 1); // drifted away above the sky
     }
     for (let i = this.sparks.length - 1; i >= 0; i--) {
       const s = this.sparks[i]; s.life -= dt;
@@ -176,17 +216,15 @@ export class Field {
   }
 
   draw(ctx: CanvasRenderingContext2D, t: number) {
-    const W = this.W, H = this.H, k = this.calm ? 0.35 : 1;
-    if (this.sky) ctx.drawImage(this.sky, 0, 0, W, H); else ctx.clearRect(0, 0, W, H);
-    for (const c of this.clouds) { ctx.globalAlpha = c.o; ctx.drawImage(c.img, c.x, c.y, 520 * c.s, 220 * c.s); }
-    ctx.globalAlpha = 1;
-    for (const l of this.land) { // parallax: nearer hills scroll faster; wrap seamlessly
-      const off = (t * l.v * k) % W;
-      ctx.drawImage(l.img, -off, 0, W, H); ctx.drawImage(l.img, W - off, 0, W, H);
-    }
-    for (const b of [...this.bubbles].sort((a, c) => a.r - c.r)) this.drawBubble(ctx, b, t);
-    for (const s of this.sparks) {
-      const q = s.life / s.max; ctx.globalAlpha = q;
+    const W = this.W, H = this.H;
+    // scenery repaints on its own slow clock, not every frame
+    if (this.lastBg < 0 || t - this.lastBg >= BG_INTERVAL) { this.drawBackdrop(t); this.lastBg = t; }
+    ctx.clearRect(0, 0, W, H);
+    this.bubbles.sort((a, c) => a.r - c.r); // back to front, in place (no per-frame copy)
+    for (let i = 0; i < this.bubbles.length; i++) this.drawBubble(ctx, this.bubbles[i], t);
+    for (let i = 0; i < this.sparks.length; i++) {
+      const s = this.sparks[i], q = s.life / s.max;
+      ctx.globalAlpha = q;
       if (s.ring) { ctx.strokeStyle = "rgba(255,255,255,0.9)"; ctx.lineWidth = 2; ctx.beginPath(); ctx.arc(s.x, s.y, s.r * (1 + (1 - q) * 0.35), 0, TAU); ctx.stroke(); }
       else { ctx.fillStyle = "rgba(240,248,255,0.95)"; ctx.beginPath(); ctx.arc(s.x, s.y, s.r * q + 0.5, 0, TAU); ctx.fill(); }
     }
@@ -198,6 +236,27 @@ export class Field {
       ctx.beginPath(); ctx.arc(p.x, p.y, 6, 0, TAU); ctx.fill(); ctx.stroke();
     }
     ctx.globalAlpha = 1;
+  }
+
+  /** Device-pixel pass over the opaque backdrop canvas: one 1:1 blit per layer, no resampling. */
+  private drawBackdrop(t: number) {
+    const g = this.gb;
+    if (!g) return;
+    const PW = g.canvas.width, PH = g.canvas.height, k = this.calm ? 0.35 : 1, bs = this.bs;
+    g.setTransform(1, 0, 0, 1, 0, 0);
+    if (this.sky) g.drawImage(this.sky, 0, 0);
+    for (let i = 0; i < this.clouds.length; i++) {
+      const c = this.clouds[i], x = c.x * bs, y = c.y * bs, w = c.w * bs, h = c.h * bs;
+      if (x + w < 0 || x > PW) continue;
+      g.globalAlpha = c.o;
+      g.drawImage(c.img, x, y, w, h);
+    }
+    g.globalAlpha = 1;
+    for (let i = 0; i < this.land.length; i++) { // parallax: nearer hills scroll faster; wrap seamlessly
+      const l = this.land[i], off = (t * l.v * k * bs) % PW;
+      g.drawImage(l.img, -off, 0);
+      g.drawImage(l.img, PW - off, 0);
+    }
   }
 
   private drawBubble(ctx: CanvasRenderingContext2D, b: Bubble, t: number) {

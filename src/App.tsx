@@ -8,6 +8,7 @@ type Status = "idle" | "loading" | "active";
 
 export default function App() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const bgRef = useRef<HTMLCanvasElement>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
   const overlayRef = useRef<HTMLCanvasElement>(null);
   const field = useRef(new Field());
@@ -25,29 +26,41 @@ export default function App() {
   // render loop (no React state touched per frame)
   useEffect(() => {
     const canvas = canvasRef.current!;
+    const bg = bgRef.current!;
     const ctx = canvas.getContext("2d")!;
     const f = field.current;
     const mq = window.matchMedia("(prefers-reduced-motion: reduce)");
     const applyMotion = () => { f.calm = mq.matches; };
     f.onPop = playPop;
+    f.attach(bg);
     applyMotion(); mq.addEventListener("change", applyMotion);
-    const resize = () => {
-      const dpr = Math.min(window.devicePixelRatio || 1, 2);
-      canvas.width = innerWidth * dpr; canvas.height = innerHeight * dpr;
+    // DPR is capped at 1.5: past that the extra pixels cost far more than they show
+    const fit = () => {
+      const dpr = Math.min(window.devicePixelRatio || 1, 1.5);
+      canvas.width = Math.round(innerWidth * dpr);
+      canvas.height = Math.round(innerHeight * dpr);
       ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
       f.resize(innerWidth, innerHeight, dpr);
     };
-    resize(); addEventListener("resize", resize);
+    // rebuilding the scenery on every resize event is expensive (mobile address bars fire it constantly)
+    let rt = 0;
+    const resize = () => { clearTimeout(rt); rt = window.setTimeout(fit, 160); };
+    fit(); addEventListener("resize", resize);
     let raf = 0, last = performance.now(), sdt = 1 / 60;
     const loop = (now: number) => {
+      raf = requestAnimationFrame(loop);
+      if (document.hidden) { last = now; return; }
       const dt = Math.min((now - last) / 1000, 0.05); last = now;
       sdt += (dt - sdt) * 0.15; // smoothed frame time removes micro-jitter
-      f.step(sdt, now / 1000); f.draw(ctx, now / 1000);
-      raf = requestAnimationFrame(loop);
+      const t = now / 1000;
+      f.step(sdt, t); f.draw(ctx, t);
     };
+    const wake = () => { last = performance.now(); };
     raf = requestAnimationFrame(loop);
+    document.addEventListener("visibilitychange", wake);
     return () => {
-      cancelAnimationFrame(raf); removeEventListener("resize", resize);
+      cancelAnimationFrame(raf); clearTimeout(rt); removeEventListener("resize", resize);
+      document.removeEventListener("visibilitychange", wake);
       mq.removeEventListener("change", applyMotion);
     };
   }, []);
@@ -69,7 +82,7 @@ export default function App() {
     }
     try {
       stream.current = await navigator.mediaDevices.getUserMedia({
-        video: { facingMode: "user", width: 640, height: 480 }, audio: false,
+        video: { facingMode: "user", width: { ideal: 480 }, height: { ideal: 360 } }, audio: false,
       });
     } catch (e) {
       const n = (e as DOMException).name;
@@ -90,15 +103,17 @@ export default function App() {
     }
     if (!stream.current) return; // stopped while loading
     running.current = true; setStatus("active"); setMessage("");
-    let lastTime = -1, lastSeen = 0;
+    let lastTime = -1, lastSeen = 0, ema = 12;
     const tick = () => {
       if (!running.current) return;
       const v = videoRef.current!, lm = landmarker.current!;
       const now = performance.now();
-      if (v.readyState >= 2 && v.currentTime !== lastTime) {
+      if (!document.hidden && v.readyState >= 2 && v.currentTime !== lastTime) {
         lastTime = v.currentTime;
+        const t0 = performance.now();
         let res: HandLandmarkerResult | null = null;
         try { res = lm.detectForVideo(v, now); } catch { /* skip a bad frame; keep the loop alive */ }
+        ema += (performance.now() - t0 - ema) * 0.2; // real inference cost, smoothed
         const pt = res ? palmCenter(res) : null;
         drawHand(overlayRef.current, pt ? res : null);
         if (pt) {
@@ -109,7 +124,8 @@ export default function App() {
         } else if (now - lastSeen > 350) { handNow.current = false; field.current.release(); }
         setTracking((s) => (s === handNow.current ? s : handNow.current));
       }
-      timer.current = window.setTimeout(tick, 33);
+      // infer less often when a frame is expensive — the scene stays at 60 fps instead of stalling behind the model
+      timer.current = window.setTimeout(tick, Math.max(48, Math.min(140, Math.round(ema * 3))));
     };
     tick();
   }, [status, stopCamera]);
@@ -127,6 +143,7 @@ export default function App() {
   return (
     <main className="stage" onPointerMove={onMove} onPointerDown={onMove}
       onPointerUp={(e) => e.pointerType === "touch" && onLeave()} onPointerLeave={onLeave}>
+      <canvas ref={bgRef} className="bg" aria-hidden="true" />
       <canvas ref={canvasRef} aria-label="Floating soap bubbles" role="img" />
       <div className={status === "idle" ? "preview hidden" : "preview"} aria-label="Live camera preview">
         <video ref={videoRef} playsInline muted />
