@@ -1,7 +1,6 @@
 interface Bubble { x: number; y: number; r: number; vx: number; vy: number; ph: number; w: number; wv: number; s: number; a: number; rise: number; }
 interface Spark { x: number; y: number; vx: number; vy: number; life: number; max: number; r: number; ring: boolean; }
 interface Cloud { img: HTMLCanvasElement; x: number; y: number; v: number; o: number; w: number; h: number; }
-interface Land { img: HTMLCanvasElement; v: number; }
 
 const TAU = 6.283185;
 const rnd = (a: number, b: number) => a + Math.random() * (b - a);
@@ -14,6 +13,20 @@ function segDist(ax: number, ay: number, bx: number, by: number, px: number, py:
   return Math.sqrt(ex * ex + ey * ey);
 }
 
+const fract = (n: number) => n - Math.floor(n);
+const hash = (i: number, seed: number) => fract(Math.sin(i * 127.1 + seed * 311.7) * 43758.5453);
+/** Smooth 1-D value noise — cheap, deterministic, and enough to fake a weathered ridgeline. */
+function noise1(x: number, seed: number) {
+  const i = Math.floor(x), f = x - i, s = f * f * (3 - 2 * f);
+  const a = hash(i, seed), b = hash(i + 1, seed);
+  return a + (b - a) * s;
+}
+function fbm(x: number, seed: number, oct: number) {
+  let v = 0, amp = 0.5, f = 1;
+  for (let i = 0; i < oct; i++) { v += amp * noise1(x * f, seed + i * 19); f *= 2; amp *= 0.5; }
+  return v; // ~0..0.94
+}
+
 /** Scenery only needs to be repainted ~20 times a second; bubbles repaint every frame. */
 const BG_INTERVAL = 0.05;
 
@@ -21,10 +34,11 @@ const BG_INTERVAL = 0.05;
 export class Field {
   bubbles: Bubble[] = []; sparks: Spark[] = [];
   W = 0; H = 0; calm = false; onPop?: (size: number) => void;
-  private clock = 0; private nextSpawn = 0;
+  private nextSpawn = 0;
   private bg: HTMLCanvasElement | null = null; private gb: CanvasRenderingContext2D | null = null;
   private bs = 1; private lastBg = -1;
-  private sky: HTMLCanvasElement | null = null; private land: Land[] = []; private clouds: Cloud[] = [];
+  private sky: HTMLCanvasElement | null = null; private terrain: HTMLCanvasElement | null = null;
+  private clouds: Cloud[] = [];
   private sprites: HTMLCanvasElement[] = []; private hl: HTMLCanvasElement | null = null;
   private target = { x: 0, y: 0, on: false };
   private p = { x: 0, y: 0, vx: 0, vy: 0, on: false, a: 0 };
@@ -69,58 +83,119 @@ export class Field {
   }
 
   private buildClouds() {
-    for (let i = 0; i < 7; i++) {
-      const s = rnd(0.55, 1.5);
-      this.clouds.push({ img: this.cloudSprite(), x: rnd(0, this.W), y: rnd(-40, this.H * 0.55),
-        v: rnd(4, 10) * s, o: 0.3 + s * 0.3, w: 520 * s, h: 220 * s });
+    for (let i = 0; i < 6; i++) {
+      const far = i < 2; // high, small, slow and faint behind the near weather
+      const s = far ? rnd(0.3, 0.55) : rnd(0.62, 1.05);
+      const w = 560 * s, h = 280 * s;
+      this.clouds.push({
+        img: this.cloudSprite(),
+        x: rnd(-w, this.W),
+        y: far ? rnd(-h * 0.25, this.H * 0.18) : rnd(-h * 0.15, this.H * 0.34 - h * 0.4),
+        v: far ? rnd(1.2, 2.6) : rnd(3.5, 7.5),
+        o: far ? rnd(0.22, 0.38) : rnd(0.45, 0.72),
+        w, h,
+      });
     }
   }
 
+  /** Cumulus: puffs lit from above, cool grey underside, soft evaporating edges. */
   private cloudSprite() {
-    const c = cv(520, 220), g = c.getContext("2d")!;
-    for (let i = 0; i < 11; i++) {
-      const cx = 520 * rnd(0.18, 0.82), cy = 220 * rnd(0.46, 0.74), r = 220 * rnd(0.22, 0.52);
-      const rg = g.createRadialGradient(cx, cy, 0, cx, cy, r);
-      rg.addColorStop(0, "rgba(255,255,255,0.95)"); rg.addColorStop(0.55, "rgba(255,255,255,0.55)"); rg.addColorStop(1, "rgba(255,255,255,0)");
+    const w = 560, h = 280, c = cv(w, h), g = c.getContext("2d")!;
+    const n = 26;
+    for (let i = 0; i < n; i++) {
+      const t = i / (n - 1), arch = Math.sin(Math.PI * t);
+      const cx = w * (0.14 + 0.72 * t) + rnd(-16, 16);
+      const cy = h * (0.70 - 0.30 * arch) + rnd(-9, 9);
+      const r = h * (0.13 + 0.20 * arch) * rnd(0.85, 1.2);
+      const rg = g.createRadialGradient(cx - r * 0.16, cy - r * 0.42, r * 0.06, cx, cy, r);
+      rg.addColorStop(0, "rgba(255,255,255,0.92)");
+      rg.addColorStop(0.5, "rgba(250,252,255,0.62)");
+      rg.addColorStop(0.82, "rgba(226,236,248,0.24)");
+      rg.addColorStop(1, "rgba(214,228,244,0)");
       g.fillStyle = rg; g.beginPath(); g.arc(cx, cy, r, 0, TAU); g.fill();
     }
+    // shade the belly, warm the crown — only where there is already cloud
+    g.globalCompositeOperation = "source-atop";
+    const shade = g.createLinearGradient(0, h * 0.4, 0, h * 0.88);
+    shade.addColorStop(0, "rgba(255,255,255,0)");
+    shade.addColorStop(1, "rgba(142,168,198,0.36)");
+    g.fillStyle = shade; g.fillRect(0, 0, w, h);
+    const light = g.createLinearGradient(0, 0, 0, h * 0.52);
+    light.addColorStop(0, "rgba(255,253,246,0.5)");
+    light.addColorStop(1, "rgba(255,253,246,0)");
+    g.fillStyle = light; g.fillRect(0, 0, w, h * 0.52);
+    g.globalCompositeOperation = "source-over";
     return c;
   }
 
+  /** Bakes sky and terrain once. Hills never move — only the clouds drift. */
   private buildScenery(bs: number) {
-    const W = this.W, H = this.H, pw = Math.ceil(W * bs), ph = Math.ceil(H * bs);
-    const c = cv(pw, ph), g = c.getContext("2d")!;
+    const W = this.W, H = this.H, pw = Math.ceil(W * bs), ph = Math.ceil(H * bs), horizon = H * 0.72;
+
+    const sky = cv(pw, ph), s = sky.getContext("2d")!;
+    s.setTransform(bs, 0, 0, bs, 0, 0);
+    const grad = s.createLinearGradient(0, 0, 0, horizon);
+    grad.addColorStop(0, "#1f63b6"); grad.addColorStop(0.3, "#3d85d0");
+    grad.addColorStop(0.62, "#7cb5e3"); grad.addColorStop(0.85, "#b6d8f0"); grad.addColorStop(1, "#dfeefa");
+    s.fillStyle = grad; s.fillRect(0, 0, W, H);
+
+    const sx = W * 0.76, sy = H * 0.15;
+    const sun = s.createRadialGradient(sx, sy, 0, sx, sy, Math.max(W, H) * 0.52);
+    sun.addColorStop(0, "rgba(255,252,238,0.95)");
+    sun.addColorStop(0.07, "rgba(255,247,219,0.55)");
+    sun.addColorStop(0.28, "rgba(255,241,205,0.16)");
+    sun.addColorStop(1, "rgba(255,241,205,0)");
+    s.fillStyle = sun; s.fillRect(0, 0, W, H);
+
+    const haze = s.createLinearGradient(0, H * 0.55, 0, horizon + H * 0.02);
+    haze.addColorStop(0, "rgba(238,248,255,0)");
+    haze.addColorStop(1, "rgba(238,248,255,0.38)");
+    s.fillStyle = haze; s.fillRect(0, H * 0.55, W, H * 0.2);
+    this.sky = sky;
+
+    // three ridgelines; distance is sold with haze, desaturation and smaller trees
+    const t = cv(pw, ph), g = t.getContext("2d")!;
     g.setTransform(bs, 0, 0, bs, 0, 0);
-    const sky = g.createLinearGradient(0, 0, 0, H);
-    sky.addColorStop(0, "#2a74cf"); sky.addColorStop(0.5, "#6fb2ec"); sky.addColorStop(0.75, "#cfe8fa"); sky.addColorStop(1, "#e6f3fb");
-    g.fillStyle = sky; g.fillRect(0, 0, W, H);
-    const sun = g.createRadialGradient(W * 0.8, H * 0.15, 0, W * 0.8, H * 0.15, Math.max(W, H) * 0.55);
-    sun.addColorStop(0, "rgba(255,250,228,0.95)"); sun.addColorStop(0.12, "rgba(255,244,210,0.5)"); sun.addColorStop(1, "rgba(255,244,210,0)");
-    g.fillStyle = sun; g.fillRect(0, 0, W, H);
-    this.sky = c;
-    // three seamless hill layers (integer sine periods tile perfectly); trees on the nearer two
-    const cfg = [
-      { base: 0.70, amp: 0.06, v: 5, top: "#a7c3e3", bot: "#d3e4f2", k: [2, 5], trees: 0 },
-      { base: 0.79, amp: 0.05, v: 12, top: "#7fb0a8", bot: "#b8d9c9", k: [3, 7], trees: 14 },
-      { base: 0.89, amp: 0.045, v: 26, top: "#58986b", bot: "#8cc488", k: [4, 9], trees: 10 },
+    const layers = [
+      { base: 0.640, amp: 0.135, freq: 2.1, seed: 3.7,  top: "#7f9fc6", bot: "#b7cee4", trees: 0,  hgt: 0.020, ink: "" },
+      { base: 0.745, amp: 0.080, freq: 2.8, seed: 9.3,  top: "#659287", bot: "#a4c5b2", trees: 24, hgt: 0.028, ink: "rgba(38,78,68,0.6)" },
+      { base: 0.870, amp: 0.048, freq: 3.3, seed: 17.1, top: "#47895d", bot: "#7fb877", trees: 18, hgt: 0.045, ink: "rgba(28,72,44,0.75)" },
     ];
-    this.land = cfg.map((l) => {
-      const img = cv(pw, ph), x = img.getContext("2d")!;
-      x.setTransform(bs, 0, 0, bs, 0, 0);
-      const p0 = rnd(0, TAU), p1 = rnd(0, TAU);
-      const yAt = (px: number) => (l.base + l.amp * (0.6 * Math.sin((TAU * l.k[0] * px) / W + p0) + 0.4 * Math.sin((TAU * l.k[1] * px) / W + p1))) * H;
-      const gr = x.createLinearGradient(0, (l.base - l.amp) * H, 0, H);
+    for (const l of layers) {
+      const ridge = (x: number) => (l.base - l.amp * ((fbm((x / W) * l.freq * 6, l.seed, 4) - 0.47) * 2.2)) * H;
+      const shape = new Path2D();
+      shape.moveTo(0, H);
+      for (let x = 0; x <= W; x += 3) shape.lineTo(x, ridge(x));
+      shape.lineTo(W, H); shape.closePath();
+      const gr = g.createLinearGradient(0, (l.base - l.amp) * H, 0, H);
       gr.addColorStop(0, l.top); gr.addColorStop(1, l.bot);
-      x.fillStyle = gr; x.beginPath(); x.moveTo(0, H);
-      for (let px = 0; px <= W; px += 4) x.lineTo(px, yAt(px));
-      x.lineTo(W, H); x.closePath(); x.fill();
-      x.fillStyle = "rgba(30,90,60,0.55)";
+      g.fillStyle = gr; g.fill(shape);
+
+      g.strokeStyle = "rgba(255,255,255,0.22)"; g.lineWidth = 1.6;
+      g.beginPath();
+      for (let x = 0; x <= W; x += 6) { const y = ridge(x); if (x === 0) g.moveTo(x, y); else g.lineTo(x, y); }
+      g.stroke();
+
       for (let i = 0; i < l.trees; i++) {
-        const tx = rnd(W * 0.03, W * 0.97), ty = yAt(tx), th = H * rnd(0.03, 0.05) * (l.v > 20 ? 1.3 : 0.9);
-        x.beginPath(); x.ellipse(tx, ty - th * 0.6, th * 0.38, th * 0.62, 0, 0, TAU); x.fill();
+        const x = rnd(W * 0.015, W * 0.985), y = ridge(x);
+        this.conifer(g, x, y + 1.5, H * l.hgt * rnd(0.7, 1.35), l.ink);
       }
-      return { img, v: l.v };
-    });
+    }
+    this.terrain = t;
+  }
+
+  /** Layered fir silhouette — reads as a tree line at any size. */
+  private conifer(g: CanvasRenderingContext2D, x: number, baseY: number, h: number, ink: string) {
+    const w = h * 0.46;
+    g.fillStyle = ink;
+    g.beginPath();
+    g.moveTo(x, baseY - h);
+    g.lineTo(x + w * 0.20, baseY - h * 0.62); g.lineTo(x + w * 0.10, baseY - h * 0.62);
+    g.lineTo(x + w * 0.34, baseY - h * 0.30); g.lineTo(x + w * 0.18, baseY - h * 0.30);
+    g.lineTo(x + w * 0.50, baseY); g.lineTo(x - w * 0.50, baseY);
+    g.lineTo(x - w * 0.18, baseY - h * 0.30); g.lineTo(x - w * 0.34, baseY - h * 0.30);
+    g.lineTo(x - w * 0.10, baseY - h * 0.62); g.lineTo(x - w * 0.20, baseY - h * 0.62);
+    g.closePath(); g.fill();
   }
 
   private buildSprites() {
@@ -164,7 +239,6 @@ export class Field {
   }
 
   step(dt: number, t: number) {
-    this.clock = t;
     const k = this.calm ? 0.35 : 1, p = this.p, tg = this.target;
     const wind = Math.sin(t * 0.07) * 9 * k;
     for (const c of this.clouds) {
@@ -218,7 +292,7 @@ export class Field {
   draw(ctx: CanvasRenderingContext2D, t: number) {
     const W = this.W, H = this.H;
     // scenery repaints on its own slow clock, not every frame
-    if (this.lastBg < 0 || t - this.lastBg >= BG_INTERVAL) { this.drawBackdrop(t); this.lastBg = t; }
+    if (this.lastBg < 0 || t - this.lastBg >= BG_INTERVAL) { this.drawBackdrop(); this.lastBg = t; }
     ctx.clearRect(0, 0, W, H);
     this.bubbles.sort((a, c) => a.r - c.r); // back to front, in place (no per-frame copy)
     for (let i = 0; i < this.bubbles.length; i++) this.drawBubble(ctx, this.bubbles[i], t);
@@ -238,11 +312,11 @@ export class Field {
     ctx.globalAlpha = 1;
   }
 
-  /** Device-pixel pass over the opaque backdrop canvas: one 1:1 blit per layer, no resampling. */
-  private drawBackdrop(t: number) {
+  /** Device-pixel pass over the opaque backdrop: sky, drifting clouds, then static terrain on top. */
+  private drawBackdrop() {
     const g = this.gb;
     if (!g) return;
-    const PW = g.canvas.width, PH = g.canvas.height, k = this.calm ? 0.35 : 1, bs = this.bs;
+    const PW = g.canvas.width, bs = this.bs;
     g.setTransform(1, 0, 0, 1, 0, 0);
     if (this.sky) g.drawImage(this.sky, 0, 0);
     for (let i = 0; i < this.clouds.length; i++) {
@@ -252,11 +326,7 @@ export class Field {
       g.drawImage(c.img, x, y, w, h);
     }
     g.globalAlpha = 1;
-    for (let i = 0; i < this.land.length; i++) { // parallax: nearer hills scroll faster; wrap seamlessly
-      const l = this.land[i], off = (t * l.v * k * bs) % PW;
-      g.drawImage(l.img, -off, 0);
-      g.drawImage(l.img, PW - off, 0);
-    }
+    if (this.terrain) g.drawImage(this.terrain, 0, 0); // hills occlude cloud bases, which sells the depth
   }
 
   private drawBubble(ctx: CanvasRenderingContext2D, b: Bubble, t: number) {
