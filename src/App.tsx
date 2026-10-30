@@ -9,7 +9,7 @@ type Phase = "break" | "done";
 
 const BREAK_MS = 10 * 60 * 1000;
 
-/** Countdown pill + shrinking bar. Kept in its own component so the 2 fps tick never re-renders the scene. */
+/** iOS-style countdown ring. Kept in its own component so the 5 fps tick never re-renders the scene. */
 function BreakTimer({ endsAt, onDone }: { endsAt: number; onDone: () => void }) {
   const [left, setLeft] = useState(() => Math.max(0, endsAt - Date.now()));
   const fired = useRef(false);
@@ -21,16 +21,21 @@ function BreakTimer({ endsAt, onDone }: { endsAt: number; onDone: () => void }) 
       if (ms <= 0 && !fired.current) { fired.current = true; onDone(); }
     };
     tick();
-    const id = window.setInterval(tick, 500); // wall clock, so a throttled tab can't stretch the break
+    const id = window.setInterval(tick, 200); // wall clock, so a throttled tab can't stretch the break
     return () => window.clearInterval(id);
   }, [endsAt, onDone]);
   const secs = Math.ceil(left / 1000);
-  const label = `${Math.floor(secs / 60)}:${String(secs % 60).padStart(2, "0")}`;
+  const label = `${String(Math.floor(secs / 60)).padStart(2, "0")}:${String(secs % 60).padStart(2, "0")}`;
   const pct = Math.max(0, Math.min(1, left / BREAK_MS));
+  const R = 54, C = 2 * Math.PI * R;
   return (
-    <div className="meter" role="timer" aria-label={`${label} left of your 10 minute break`}>
-      <span className="meter-time">{label}</span>
-      <span className="meter-track"><i style={{ transform: `scaleX(${pct})` }} /></span>
+    <div className="timer" role="timer" aria-label={`${label} left of your 10 minute break`}>
+      <svg viewBox="0 0 128 128" aria-hidden="true">
+        <circle className="ring-track" cx="64" cy="64" r={R} />
+        <circle className="ring-fill" cx="64" cy="64" r={R}
+          strokeDasharray={C} strokeDashoffset={C * (1 - pct)} />
+      </svg>
+      <span className="timer-time">{label}</span>
     </div>
   );
 }
